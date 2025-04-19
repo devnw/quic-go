@@ -977,7 +977,7 @@ func (s *connection) handleOnePacket(rp receivedPacket) (wasProcessed bool, _ er
 			if counter > 0 {
 				p.buffer.Split()
 			}
-			processed, err := s.handleShortHeaderPacket(p)
+			processed, err := s.handleShortHeaderPacket(p, counter > 0)
 			if err != nil {
 				return false, err
 			}
@@ -992,7 +992,7 @@ func (s *connection) handleOnePacket(rp receivedPacket) (wasProcessed bool, _ er
 	return wasProcessed, nil
 }
 
-func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed bool, _ error) {
+func (s *connection) handleShortHeaderPacket(p receivedPacket, isCoalesced bool) (wasProcessed bool, _ error) {
 	var wasQueued bool
 
 	defer func() {
@@ -1009,6 +1009,17 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed boo
 	}
 	pn, pnLen, keyPhase, data, err := s.unpacker.UnpackShortHeader(p.rcvTime, p.data)
 	if err != nil {
+		// Stateless reset packets (see RFC 9000, section 10.3):
+		// * fill the entire UDP datagram (i.e. they cannot be part of a coalesced packet)
+		// * are short header packets (first bit is 0)
+		// * have the QUIC bit set (second bit is 1)
+		// * are at least 21 bytes long
+		if !isCoalesced && len(p.data) >= protocol.MinReceivedStatelessResetSize && p.data[0]&0b11000000 == 0b01000000 {
+			token := protocol.StatelessResetToken(p.data[len(p.data)-16:])
+			if s.connIDManager.IsActiveStatelessResetToken(token) {
+				return false, &StatelessResetError{}
+			}
+		}
 		wasQueued, err = s.handleUnpackError(err, p, logging.PacketType1RTT)
 		return false, err
 	}
@@ -1064,7 +1075,7 @@ func (s *connection) handleShortHeaderPacket(p receivedPacket) (wasProcessed boo
 			s.logger,
 		)
 	}
-	destConnID, frames, shouldSwitchPath := s.pathManager.HandlePacket(p.remoteAddr, pathChallenge, isNonProbing)
+	destConnID, frames, shouldSwitchPath := s.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenge, isNonProbing)
 	if len(frames) > 0 {
 		probe, buf, err := s.packer.PackPathProbePacket(destConnID, frames, s.version)
 		if err != nil {
@@ -2308,29 +2319,25 @@ func (s *connection) sendProbePacket(sendMode ackhandler.SendMode, now time.Time
 	// Queue probe packets until we actually send out a packet,
 	// or until there are no more packets to queue.
 	var packet *coalescedPacket
-	for {
+	for packet == nil {
 		if wasQueued := s.sentPacketHandler.QueueProbePacket(encLevel); !wasQueued {
 			break
 		}
 		var err error
-		packet, err = s.packer.MaybePackPTOProbePacket(encLevel, s.maxPacketSize(), now, s.version)
+		packet, err = s.packer.PackPTOProbePacket(encLevel, s.maxPacketSize(), false, now, s.version)
 		if err != nil {
 			return err
 		}
-		if packet != nil {
-			break
-		}
 	}
 	if packet == nil {
-		s.retransmissionQueue.AddPing(encLevel)
 		var err error
-		packet, err = s.packer.MaybePackPTOProbePacket(encLevel, s.maxPacketSize(), now, s.version)
+		packet, err = s.packer.PackPTOProbePacket(encLevel, s.maxPacketSize(), true, now, s.version)
 		if err != nil {
 			return err
 		}
 	}
 	if packet == nil || (len(packet.longHdrPackets) == 0 && packet.shortHdrPacket == nil) {
-		return fmt.Errorf("connection BUG: couldn't pack %s probe packet", encLevel)
+		return fmt.Errorf("connection BUG: couldn't pack %s probe packet: %v", encLevel, packet)
 	}
 	return s.sendPackedCoalescedPacket(packet, s.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket()), now)
 }
